@@ -19,6 +19,8 @@ from .settings import (
     ORACLE_PRICES_CACHE_MINUTES,
     PRICE_BATCH_SIZE,
     GOOD_ENOUGH_PAGINATION_LIMIT,
+    POOL_PAGE_SIZE,
+    PRICE_THRESHOLD_FILTER,
 )
 from .helpers import cache_in_seconds, normalize_address, chunk
 
@@ -62,7 +64,7 @@ class Token:
     async def get_all_tokens(cls) -> List["Token"]:
         sugar = w3.eth.contract(address=LP_SUGAR_ADDRESS, abi=LP_SUGAR_ABI)
         tokens = await sugar.functions.tokens(
-            GOOD_ENOUGH_PAGINATION_LIMIT, 0, ADDRESS_ZERO
+            GOOD_ENOUGH_PAGINATION_LIMIT, 0, ADDRESS_ZERO, []
         ).call()
         return list(map(lambda t: Token.from_tuple(t), tokens))
 
@@ -132,26 +134,32 @@ class Price:
     @classmethod
     @cache_in_seconds(ORACLE_PRICES_CACHE_MINUTES * 60)
     async def _get_prices(
-        cls, tokens: Tuple[Token], stable_token: str, connector_tokens: Tuple[str]
+        cls,
+        tokens: Tuple[Token],
+        stable_token: str,
+        connector_tokens: Tuple[str],
+        base_rate: float,
     ):
         price_oracle = w3.eth.contract(
             address=PRICE_ORACLE_ADDRESS, abi=PRICE_ORACLE_ABI
         )
-        pricing_token_list = (
-            list(map(lambda t: t.token_address, tokens))
-            + list(connector_tokens)
-            + [stable_token]
-        )
-        prices = await price_oracle.functions.getManyRatesWithConnectors(
-            len(tokens), pricing_token_list
+        token_list = list(map(lambda t: t.token_address, tokens))
+        prices = await price_oracle.functions.getManyRatesToEthWithCustomConnectors(
+            token_list,
+            False,
+            token_list + list(connector_tokens) + [stable_token],
+            PRICE_THRESHOLD_FILTER,
         ).call()
 
         results = []
 
         for cnt, price in enumerate(prices):
-            # XX: decimals are auto set to 18, see
-            # https://github.com/velodrome-finance/oracle/blob/main/contracts/VeloOracle.sol#L126
-            results.append(Price(token=tokens[cnt], price=price / 10**18))
+            token = tokens[cnt]
+            # XX: decimals are auto set to 18
+            denom = 10 ** (18 + (18 - token.decimals))
+
+            conv_price = (price / denom) / base_rate
+            results.append(Price(token=token, price=conv_price))
 
         return results
 
@@ -174,6 +182,18 @@ class Price:
         Returns:
             List: list of Price objects
         """
+        stable = await Token.get_by_token_address(STABLE_TOKEN_ADDRESS)
+        [base_price] = await cls._get_prices(
+            tuple([stable]),
+            stable_token,
+            tuple(connector_tokens),
+            # base rate is 1, since we don't want any conversion applied
+            1,
+        )
+
+        # assume the pricing is wrong if the base price failed
+        base_rate = 0 if base_price is None else base_price.price
+
         batches = await asyncio.gather(
             *map(
                 lambda ts: cls._get_prices(
@@ -181,6 +201,7 @@ class Price:
                     tuple(ts),
                     stable_token,
                     tuple(connector_tokens),
+                    base_rate,
                 ),
                 list(chunk(tokens, PRICE_BATCH_SIZE)),
             )
@@ -212,39 +233,73 @@ class LiquidityPool:
     emissions: Amount
     emissions_token: Token
     weekly_emissions: Amount
+    nfpm: str
+    alm: str
 
     @classmethod
     def from_tuple(
         cls, t: Tuple, tokens: Dict[str, Token], prices: Dict[str, Price]
     ) -> "LiquidityPool":
-        token0 = normalize_address(t[5])
-        token1 = normalize_address(t[8])
+        token0 = normalize_address(t[7])
+        token1 = normalize_address(t[10])
         token0_fees = t[23]
         token1_fees = t[24]
-        emissions_token = normalize_address(t[18])
-        emissions = t[17]
+        emissions_token = normalize_address(t[20])
+        emissions = t[19]
 
         seconds_in_a_week = 7 * 24 * 60 * 60
+
+        # Sugar.all returns a tuple with the following structure:
+        # { "name": "lp", "type": "address" },          <== 0
+        # { "name": "symbol", "type": "string" },       <== 1
+        # { "name": "decimals", "type": "uint8" },      <== 2
+        # { "name": "liquidity", "type": "uint256" },   <== 3
+        # { "name": "type", "type": "int24" },          <== 4
+        # { "name": "tick", "type": "int24" },          <== 5
+        # { "name": "sqrt_ratio", "type": "uint160" },  <== 6
+        # { "name": "token0", "type": "address" },      <== 7
+        # { "name": "reserve0", "type": "uint256" },    <== 8
+        # { "name": "staked0", "type": "uint256" },     <== 9
+        # { "name": "token1", "type": "address" },      <== 10
+        # { "name": "reserve1", "type": "uint256" },    <== 11
+        # { "name": "staked1", "type": "uint256" },     <== 12
+        # { "name": "gauge", "type": "address" },        <== 13
+        # { "name": "gauge_liquidity", "type": "uint256" },  <== 14
+        # { "name": "gauge_alive", "type": "bool" },        <== 15
+        # { "name": "fee", "type": "address" },             <== 16
+        # { "name": "bribe", "type": "address" },           <== 17
+        # { "name": "factory", "type": "address" },         <== 18
+        # { "name": "emissions", "type": "uint256" },       <== 19
+        # { "name": "emissions_token", "type": "address" },  <== 20
+        # { "name": "pool_fee", "type": "uint256" },        <== 21
+        # { "name": "unstaked_fee", "type": "uint256" },    <== 22
+        # { "name": "token0_fees", "type": "uint256" },     <== 23
+        # { "name": "token1_fees", "type": "uint256" },    <== 24
+        # { "name": "nfpm", "type": "address" },           <== 25
+        # { "name": "alm", "type": "address" }             <== 26
 
         return LiquidityPool(
             lp=normalize_address(t[0]),
             symbol=t[1],
-            is_stable=t[3],
-            total_supply=t[4],
+            # stable pools have type set to 0
+            is_stable=t[4] == 0,
+            total_supply=t[3],
             decimals=t[2],
             token0=tokens.get(token0),
-            reserve0=Amount.build(token0, t[6], tokens, prices),
+            reserve0=Amount.build(token0, t[8], tokens, prices),
             token1=tokens.get(token1),
-            reserve1=Amount.build(token1, t[9], tokens, prices),
+            reserve1=Amount.build(token1, t[11], tokens, prices),
             token0_fees=Amount.build(token0, token0_fees, tokens, prices),
             token1_fees=Amount.build(token1, token1_fees, tokens, prices),
-            pool_fee=t[22],
-            gauge_total_supply=t[12],
+            pool_fee=t[21],
+            gauge_total_supply=t[14],
             emissions_token=tokens.get(emissions_token),
             emissions=Amount.build(emissions_token, emissions, tokens, prices),
             weekly_emissions=Amount.build(
                 emissions_token, emissions * seconds_in_a_week, tokens, prices
             ),
+            nfpm=normalize_address(t[25]),
+            alm=normalize_address(t[26]),
         )
 
     @classmethod
@@ -257,9 +312,19 @@ class LiquidityPool:
         prices = {price.token.token_address: price for price in prices}
 
         sugar = w3.eth.contract(address=LP_SUGAR_ADDRESS, abi=LP_SUGAR_ABI)
-        pools = await sugar.functions.all(
-            GOOD_ENOUGH_PAGINATION_LIMIT, 0, ADDRESS_ZERO
-        ).call()
+        pools = []
+        pool_offset = 0
+
+        while True:
+            pools_batch = await sugar.functions.all(POOL_PAGE_SIZE, pool_offset).call()
+
+            pools += pools_batch
+
+            if len(pools_batch) < POOL_PAGE_SIZE:
+                break
+            else:
+                pool_offset += POOL_PAGE_SIZE
+
         return list(
             filter(
                 lambda p: p is not None,
